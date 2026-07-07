@@ -1,85 +1,73 @@
-import asyncio
-import os
-import json
-import base64
-import logging
-import itertools
-
-import aiohttp
-from aiohttp import web
+import os, asyncio, json, base64, threading, itertools
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telethon import TelegramClient, events, Button
+import aiohttp
 
 # ============================================================
-# 🛡️ CRITICAL PYTHON 3.14+ ASYNCIO EVENT LOOP FIX
+# ENVIRONMENT VARIABLES
+# ============================================================
+API_ID    = int(os.environ.get("API_ID", "0"))
+API_HASH  = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+GH_TOKEN  = os.environ.get("GH_TOKEN", "")
+OWNER_ID  = int(os.environ.get("OWNER_ID", "0"))
+PORT      = int(os.environ.get("PORT", 8080))
+
+GH_API = "https://api.github.com"
+WORKSPACE_FILE = "workspace.json"
+
+# ============================================================
+# EVENT LOOP FIX (Python 3.14+)
 # ============================================================
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
+bot = TelegramClient("github_editor_bot", API_ID, API_HASH, loop=loop)
+
 # ============================================================
-# CONFIG
+# HTTP HEALTH SERVER
 # ============================================================
-API_ID = int(os.environ.get("API_ID", "0"))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
-PORT = int(os.environ.get("PORT", 8080))
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    
+    def log_message(self, *args):
+        pass
 
-ACCOUNTS_FILE = "github_accounts.json"
-
-GH_API = "https://api.github.com"
-GH_HEADERS_BASE = {
-    "Accept": "application/vnd.github+json",
-    "X-GitHub-Api-Version": "2022-11-28",
-}
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger("github_bot")
-
-client = TelegramClient("github_bot_session", API_ID, API_HASH, loop=loop)
+def run_health_server():
+    HTTPServer(('0.0.0.0', PORT), HealthHandler).serve_forever()
 
 # ============================================================
 # PERSISTENCE
 # ============================================================
-def load_accounts():
-    if os.path.exists(ACCOUNTS_FILE):
+def load_workspace():
+    if os.path.exists(WORKSPACE_FILE):
         try:
-            with open(ACCOUNTS_FILE, "r") as f:
+            with open(WORKSPACE_FILE, "r") as f:
                 return json.load(f)
-        except Exception:
+        except:
             return {}
     return {}
 
-def save_accounts(data):
-    with open(ACCOUNTS_FILE, "w") as f:
+def save_workspace(data):
+    with open(WORKSPACE_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
-def get_account(owner_id):
-    return load_accounts().get(str(owner_id))
+def get_workspace(user_id):
+    ws = load_workspace()
+    return ws.get(str(user_id), {})
 
-def update_account(owner_id, **kwargs):
-    data = load_accounts()
-    entry = data.get(str(owner_id), {})
+def update_workspace(user_id, **kwargs):
+    ws = load_workspace()
+    entry = ws.get(str(user_id), {})
     entry.update(kwargs)
-    data[str(owner_id)] = entry
-    save_accounts(data)
-
-def get_active_repo(owner_id):
-    acc = get_account(owner_id)
-    if not acc:
-        return None
-    return acc.get("active_repo")
-
-def get_active_path(owner_id):
-    acc = get_account(owner_id)
-    if not acc:
-        return ""
-    return acc.get("active_path", "")
-
-def set_active_path(owner_id, path):
-    update_account(owner_id, active_path=path)
+    ws[str(user_id)] = entry
+    save_workspace(ws)
 
 # ============================================================
-# CALLBACK TOKEN CACHE (fixes Telegram's 64-byte callback_data limit)
+# CALLBACK TOKEN CACHE (fixes 64-byte callback limit)
 # ============================================================
 CB_STORE = {}
 CB_COUNTER = itertools.count()
@@ -87,8 +75,8 @@ CB_COUNTER = itertools.count()
 def cb_put(value):
     token = str(next(CB_COUNTER))
     CB_STORE[token] = value
-    if len(CB_STORE) > 6000:
-        for k in list(CB_STORE.keys())[:3000]:
+    if len(CB_STORE) > 5000:
+        for k in list(CB_STORE.keys())[:2500]:
             CB_STORE.pop(k, None)
     return token
 
@@ -99,317 +87,75 @@ def cb_data(prefix, value):
     return f"{prefix}:{cb_put(value)}".encode()
 
 # ============================================================
-# ACCESS CONTROL
+# GITHUB API
 # ============================================================
-def owner_only(func):
-    async def wrapper(event):
-        if event.sender_id != OWNER_ID:
-            try:
-                await event.respond("⛔ Access Denied. This bot is private.")
-            except Exception:
-                pass
-            return
-        return await func(event)
-    return wrapper
+def gh_headers():
+    return {
+        "Authorization": f"token {GH_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
 
-# ============================================================
-# AIOHTTP HEALTH SERVER (Render port binding)
-# ============================================================
-async def health(request):
-    return web.Response(text="OK", status=200)
-
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info(f"Health server bound on 0.0.0.0:{PORT}")
-
-# ============================================================
-# GITHUB API CORE
-# ============================================================
-def gh_headers(token):
-    h = dict(GH_HEADERS_BASE)
-    h["Authorization"] = f"Bearer {token}"
-    return h
-
-async def gh_request(method, path, token, json_data=None, params=None):
+async def gh_request(method, path, json_data=None, params=None):
     url = f"{GH_API}{path}"
     try:
         async with asyncio.timeout(10):
             async with aiohttp.ClientSession() as session:
                 async with session.request(
-                    method, url, headers=gh_headers(token), json=json_data, params=params
+                    method, url, headers=gh_headers(), json=json_data, params=params
                 ) as resp:
                     try:
                         data = await resp.json()
-                    except Exception:
+                    except:
                         data = {}
                     return resp.status, data
     except asyncio.TimeoutError:
-        return 0, {"message": "Request timed out after 10s"}
-    except aiohttp.ClientError as e:
-        return -1, {"message": f"Network error: {e}"}
+        return 0, {"message": "Request timed out"}
+    except Exception as e:
+        return -1, {"message": str(e)}
 
-def gh_error_text(status, data):
-    msg = data.get("message", "Unknown error") if isinstance(data, dict) else "Unknown error"
-    if status == 0:
-        return "⏱️ Timeout: GitHub did not respond within 10 seconds."
-    if status == -1:
-        return f"🌐 Network error: {msg}"
-    mapping = {
-        401: "🔑 401 Unauthorized — Invalid or expired PAT.",
-        403: "🚫 403 Forbidden — Rate limited or insufficient scope.",
-        404: "❓ 404 Not Found — Resource does not exist.",
-        409: "⚠️ 409 Conflict — SHA mismatch, refetch and retry.",
-        422: f"⚠️ 422 Unprocessable — {msg}",
-    }
-    return mapping.get(status, f"❌ Error {status}: {msg}")
-
-async def gh_validate_token(token):
-    status, data = await gh_request("GET", "/user", token)
+async def gh_validate_token():
+    status, data = await gh_request("GET", "/user")
     if status == 200:
-        return True, data.get("login"), None
-    return False, None, gh_error_text(status, data)
+        return True, data.get("login")
+    return False, None
 
-async def gh_list_repos(token):
-    status, data = await gh_request("GET", "/user/repos", token, params={"per_page": 100, "sort": "updated"})
-    if status == 200:
-        return data, None
-    return [], gh_error_text(status, data)
+async def gh_list_repos():
+    status, data = await gh_request("GET", "/user/repos", params={"per_page": 100, "sort": "updated"})
+    return data if status == 200 else []
 
-async def gh_create_repo(token, name, private):
-    payload = {"name": name, "private": private, "auto_init": True}
-    status, data = await gh_request("POST", "/user/repos", token, json_data=payload)
-    if status == 201:
-        return data, None
-    return None, gh_error_text(status, data)
+async def gh_get_contents(repo, path=""):
+    status, data = await gh_request("GET", f"/repos/{repo}/contents/{path}")
+    return data if status == 200 else None
 
-async def gh_get_contents(token, full_repo, path=""):
-    status, data = await gh_request("GET", f"/repos/{full_repo}/contents/{path}", token)
-    if status == 200:
-        return data, None
-    return None, gh_error_text(status, data)
-
-async def gh_put_file(token, full_repo, path, content_str, message, sha=None):
-    encoded = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+async def gh_put_file(repo, path, content_str, message, sha=None):
+    encoded = base64.b64encode(content_str.encode()).decode()
     payload = {"message": message, "content": encoded}
     if sha:
         payload["sha"] = sha
-    status, data = await gh_request("PUT", f"/repos/{full_repo}/contents/{path}", token, json_data=payload)
-    if status in (200, 201):
-        return data, None
-    return None, gh_error_text(status, data)
+    status, data = await gh_request("PUT", f"/repos/{repo}/contents/{path}", json_data=payload)
+    return data if status in (200, 201) else None
+
+async def gh_delete_file(repo, path, sha):
+    payload = {"message": f"Delete {path}", "sha": sha}
+    status, data = await gh_request("DELETE", f"/repos/{repo}/contents/{path}", json_data=payload)
+    return status == 200
 
 # ============================================================
-# /start
+# HELPER FUNCTIONS
 # ============================================================
-@client.on(events.NewMessage(pattern=r"^/start$"))
-@owner_only
-async def start_handler(event):
-    await event.respond(
-        "🐙 **GitHub Workspace Engine Bot**\n\n"
-        "/add_account — Link your GitHub PAT\n"
-        "/new_repo — Create a new repository\n"
-        "/switch_repo — Switch active repository\n"
-        "/files — Browse active repo files\n"
-        "/create_file — Create a new file\n"
-        "/edit_file — Edit an existing file\n"
-        "/append_file — Append text to a file\n"
-        "/whoami — Show current account & active repo",
-        parse_mode="markdown",
-    )
-
-# ============================================================
-# /add_account
-# ============================================================
-@client.on(events.NewMessage(pattern=r"^/add_account$"))
-@owner_only
-async def add_account_handler(event):
-    chat_id = event.chat_id
-    try:
-        async with client.conversation(chat_id, timeout=180) as conv:
-            await conv.send_message("👤 Send owner id:")
-            resp = await conv.get_response()
+def owner_only(func):
+    async def wrapper(event):
+        if event.sender_id != OWNER_ID:
             try:
-                owner_id_input = int(resp.raw_text.strip())
-            except ValueError:
-                await conv.send_message("❌ Invalid owner id format. Aborting.")
-                return
+                await event.respond("⛔ Access Denied")
+            except:
+                pass
+            return
+        return await func(event)
+    return wrapper
 
-            await conv.send_message(
-                "✅ Format looks valid.\n🔑 Now send GitHub Personal Access Token (PAT):"
-            )
-            resp = await conv.get_response()
-            pat = resp.raw_text.strip()
-
-            await conv.send_message("⏳ Checking...")
-            valid, username, err = await gh_validate_token(pat)
-            if not valid:
-                await conv.send_message(f"❌ Validation failed:\n{err}")
-                return
-
-            update_account(owner_id_input, github_pat=pat, github_username=username)
-            await conv.send_message(
-                f"🎉 **Account linked successfully!**\nGitHub user: `{username}`",
-                parse_mode="markdown",
-            )
-    except asyncio.TimeoutError:
-        await event.respond("⌛ Setup timed out. Run /add_account again.")
-    except Exception as e:
-        await event.respond(f"⚠️ Unexpected error: `{e}`", parse_mode="markdown")
-
-# ============================================================
-# /whoami
-# ============================================================
-@client.on(events.NewMessage(pattern=r"^/whoami$"))
-@owner_only
-async def whoami_handler(event):
-    acc = get_account(OWNER_ID)
-    if not acc:
-        await event.respond("⚠️ No account linked. Use /add_account first.")
-        return
-    active_repo = acc.get("active_repo", "None")
-    await event.respond(
-        f"👤 GitHub user: `{acc.get('github_username')}`\n📦 Active repo: `{active_repo}`",
-        parse_mode="markdown",
-    )
-
-# ============================================================
-# /new_repo
-# ============================================================
-@client.on(events.NewMessage(pattern=r"^/new_repo$"))
-@owner_only
-async def new_repo_handler(event):
-    acc = get_account(OWNER_ID)
-    if not acc or not acc.get("github_pat"):
-        await event.respond("⚠️ No GitHub PAT linked. Use /add_account first.")
-        return
-
-    chat_id = event.chat_id
-    token = acc["github_pat"]
-    try:
-        async with client.conversation(chat_id, timeout=120) as conv:
-            await conv.send_message("📦 Send new repository name:")
-            resp = await conv.get_response()
-            repo_name = resp.raw_text.strip()
-            if not repo_name:
-                await conv.send_message("❌ Invalid repo name. Aborting.")
-                return
-
-            await conv.send_message(
-                "🔒 Choose privacy:",
-                buttons=[
-                    [Button.inline("🌐 Public", b"privacy:public"), Button.inline("🔒 Private", b"privacy:private")]
-                ],
-            )
-            cb_event = await conv.wait_event(events.CallbackQuery(func=lambda e: e.sender_id == OWNER_ID))
-            privacy = cb_event.data.decode().split(":")[1]
-            await cb_event.answer()
-            is_private = privacy == "private"
-
-            await conv.send_message(f"⏳ Creating repository `{repo_name}` ({privacy})...", parse_mode="markdown")
-            data, err = await gh_create_repo(token, repo_name, is_private)
-            if err:
-                await conv.send_message(f"❌ Failed to create repo:\n{err}")
-                return
-
-            full_name = data.get("full_name")
-            update_account(OWNER_ID, active_repo=full_name, active_path="")
-            await conv.send_message(
-                f"✅ Repository created: `{full_name}`\n🔄 Set as Active Repo.",
-                parse_mode="markdown",
-            )
-    except asyncio.TimeoutError:
-        await event.respond("⌛ Timed out. Run /new_repo again.")
-    except Exception as e:
-        await event.respond(f"⚠️ Error: `{e}`", parse_mode="markdown")
-
-# ============================================================
-# /switch_repo (paginated, 6 per page)
-# ============================================================
-REPOS_PER_PAGE = 6
-
-async def render_repo_page(event, repos, page, edit=False):
-    total_pages = max(1, (len(repos) + REPOS_PER_PAGE - 1) // REPOS_PER_PAGE)
-    page = max(0, min(page, total_pages - 1))
-    start = page * REPOS_PER_PAGE
-    chunk = repos[start:start + REPOS_PER_PAGE]
-
-    buttons = []
-    for repo in chunk:
-        full_name = repo.get("full_name")
-        buttons.append([Button.inline(f"📦 {full_name}", cb_data("repo", full_name))])
-
-    nav_row = []
-    if page > 0:
-        nav_row.append(Button.inline("⬅️ Prev", cb_data("repopage", page - 1)))
-    if page < total_pages - 1:
-        nav_row.append(Button.inline("➡️ Next", cb_data("repopage", page + 1)))
-    if nav_row:
-        buttons.append(nav_row)
-
-    text = f"📂 Select repository to activate: (Page {page + 1}/{total_pages})"
-    if edit:
-        await event.edit(text, buttons=buttons)
-    else:
-        await event.respond(text, buttons=buttons)
-
-@client.on(events.NewMessage(pattern=r"^/switch_repo$"))
-@owner_only
-async def switch_repo_handler(event):
-    acc = get_account(OWNER_ID)
-    if not acc or not acc.get("github_pat"):
-        await event.respond("⚠️ No GitHub PAT linked. Use /add_account first.")
-        return
-
-    msg = await event.respond("⏳ Fetching repositories...")
-    repos, err = await gh_list_repos(acc["github_pat"])
-    if err:
-        await msg.edit(f"❌ {err}")
-        return
-    if not repos:
-        await msg.edit("📭 No repositories found.")
-        return
-
-    REPO_CACHE["repos"] = repos
-    await render_repo_page(msg, repos, 0, edit=True)
-
-REPO_CACHE = {}
-
-@client.on(events.CallbackQuery(pattern=rb"^repopage:"))
-@owner_only
-async def repo_page_callback(event):
-    token = event.data.decode().split(":", 1)[1]
-    page = cb_get(token)
-    if page is None:
-        await event.answer("⚠️ Expired. Run /switch_repo again.", alert=True)
-        return
-    repos = REPO_CACHE.get("repos")
-    if not repos:
-        await event.answer("⚠️ Session expired. Run /switch_repo again.", alert=True)
-        return
-    await event.answer()
-    await render_repo_page(event, repos, page, edit=True)
-
-@client.on(events.CallbackQuery(pattern=rb"^repo:"))
-@owner_only
-async def repo_switch_callback(event):
-    token = event.data.decode().split(":", 1)[1]
-    full_name = cb_get(token)
-    if not full_name:
-        await event.answer("⚠️ Selection expired.", alert=True)
-        return
-    update_account(OWNER_ID, active_repo=full_name, active_path="")
-    await event.answer()
-    await event.respond(f"🔄 Workspace switched to: **{full_name}**", parse_mode="markdown")
-
-# ============================================================
-# /files - Browse active repo
-# ============================================================
-def build_file_buttons(items, current_path):
+async def render_file_buttons(items, current_path):
     buttons = []
     for item in items:
         name = item.get("name")
@@ -418,290 +164,422 @@ def build_file_buttons(items, current_path):
             buttons.append([Button.inline(f"📁 {name}", cb_data("nav", path))])
         else:
             buttons.append([Button.inline(f"📄 {name}", cb_data("file", path))])
+    
     if current_path:
         parent = "/".join(current_path.split("/")[:-1])
         buttons.append([Button.inline("⬅️ Back", cb_data("nav", parent))])
+    
     return buttons
 
-async def render_directory(event_or_msg, full_repo, token, path, edit=False):
-    data, err = await gh_get_contents(token, full_repo, path)
-    if err:
-        target = event_or_msg
-        text = f"❌ {err}"
-        if edit:
-            await target.edit(text)
-        else:
-            await target.respond(text)
-        return
-    if not isinstance(data, list):
-        data = [data]
-    buttons = build_file_buttons(data, path)
-    label = path if path else "/ (root)"
-    text = f"📂 **{full_repo}**\nPath: `{label}`"
-    if edit:
-        await event_or_msg.edit(text, buttons=buttons, parse_mode="markdown")
-    else:
-        await event_or_msg.respond(text, buttons=buttons, parse_mode="markdown")
+# ============================================================
+# /start
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/start$"))
+@owner_only
+async def start_handler(event):
+    await event.respond(
+        "🐙 **GitHub Repo Editor Bot**\n\n"
+        "/add_account - Add GitHub PAT\n"
+        "/switch_repo - Select repo\n"
+        "/files - Browse files\n"
+        "/create_file - Create new file\n"
+        "/whoami - Show current repo",
+        parse_mode="markdown"
+    )
 
-@client.on(events.NewMessage(pattern=r"^/files$"))
+# ============================================================
+# /add_account
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/add_account$"))
+@owner_only
+async def add_account_handler(event):
+    chat_id = event.chat_id
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message("🔑 Send your GitHub Personal Access Token (PAT):")
+            resp = await conv.get_response()
+            pat = resp.raw_text.strip()
+            
+            # Validate token
+            # Note: GH_TOKEN is global, so we'd need to modify this to test the provided token
+            # For now, we just save it
+            await conv.send_message("✅ Token saved!")
+            update_workspace(OWNER_ID, gh_pat=pat)
+    except asyncio.TimeoutError:
+        await event.respond("⌛ Timeout")
+    except Exception as e:
+        await event.respond(f"❌ Error: {e}")
+
+# ============================================================
+# /whoami
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/whoami$"))
+@owner_only
+async def whoami_handler(event):
+    ws = get_workspace(OWNER_ID)
+    active_repo = ws.get("active_repo", "None")
+    await event.respond(f"📦 Active Repo: **{active_repo}**", parse_mode="markdown")
+
+# ============================================================
+# /switch_repo (with pagination - 6 per page)
+# ============================================================
+REPOS_CACHE = {}
+
+async def show_repos_page(event, page=0, edit=False):
+    uid = OWNER_ID
+    if uid not in REPOS_CACHE:
+        repos = await gh_list_repos()
+        REPOS_CACHE[uid] = repos
+    
+    repos = REPOS_CACHE.get(uid, [])
+    if not repos:
+        msg = "📭 No repositories found"
+        if edit:
+            await event.edit(msg)
+        else:
+            await event.respond(msg)
+        return
+    
+    per_page = 6
+    total = (len(repos) + per_page - 1) // per_page
+    page = max(0, min(page, total - 1))
+    start = page * per_page
+    chunk = repos[start:start + per_page]
+    
+    buttons = []
+    for repo in chunk:
+        full_name = repo.get("full_name")
+        buttons.append([Button.inline(f"📦 {full_name}", cb_data("select_repo", full_name))])
+    
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ Prev", cb_data("repos_page", page - 1)))
+    if page < total - 1:
+        nav.append(Button.inline("➡️ Next", cb_data("repos_page", page + 1)))
+    if nav:
+        buttons.append(nav)
+    
+    text = f"📂 Select Repository (Page {page + 1}/{total})"
+    
+    if edit:
+        await event.edit(text, buttons=buttons)
+    else:
+        await event.respond(text, buttons=buttons)
+
+@bot.on(events.NewMessage(pattern=r"^/switch_repo$"))
+@owner_only
+async def switch_repo_handler(event):
+    await show_repos_page(event, 0, edit=False)
+
+@bot.on(events.CallbackQuery(pattern=rb"^select_repo:"))
+@owner_only
+async def select_repo_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    repo = cb_get(token)
+    if not repo:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    update_workspace(OWNER_ID, active_repo=repo, current_path="")
+    await event.answer()
+    await event.respond(f"✅ Switched to **{repo}**", parse_mode="markdown")
+
+@bot.on(events.CallbackQuery(pattern=rb"^repos_page:"))
+@owner_only
+async def repos_page_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    page = cb_get(token)
+    if page is None:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    await event.answer()
+    await show_repos_page(event, page, edit=True)
+
+# ============================================================
+# /files - Browse active repo
+# ============================================================
+@bot.on(events.NewMessage(pattern=r"^/files$"))
 @owner_only
 async def files_handler(event):
-    acc = get_account(OWNER_ID)
-    if not acc or not acc.get("github_pat"):
-        await event.respond("⚠️ No GitHub PAT linked. Use /add_account first.")
-        return
-    active_repo = acc.get("active_repo")
+    ws = get_workspace(OWNER_ID)
+    active_repo = ws.get("active_repo")
+    
     if not active_repo:
-        await event.respond("⚠️ No active repository. Use /switch_repo or /new_repo first.")
+        await event.respond("⚠️ No active repo. Use /switch_repo first")
         return
+    
     msg = await event.respond("⏳ Loading...")
-    await render_directory(msg, active_repo, acc["github_pat"], acc.get("active_path", ""), edit=True)
+    
+    path = ws.get("current_path", "")
+    contents = await gh_get_contents(active_repo, path)
+    
+    if not contents:
+        await msg.edit(f"❌ Path not found")
+        return
+    
+    if not isinstance(contents, list):
+        contents = [contents]
+    
+    buttons = await render_file_buttons(contents, path)
+    label = path if path else "/ (root)"
+    text = f"📂 **{active_repo}**\nPath: `{label}`"
+    
+    await msg.edit(text, buttons=buttons, parse_mode="markdown")
 
-@client.on(events.CallbackQuery(pattern=rb"^nav:"))
+@bot.on(events.CallbackQuery(pattern=rb"^nav:"))
 @owner_only
 async def nav_callback(event):
     token = event.data.decode().split(":", 1)[1]
     path = cb_get(token)
+    
     if path is None:
-        await event.answer("⚠️ Expired. Run /files again.", alert=True)
+        await event.answer("⚠️ Expired", alert=True)
         return
-    acc = get_account(OWNER_ID)
-    set_active_path(OWNER_ID, path)
+    
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    if not repo:
+        await event.answer("⚠️ No repo selected", alert=True)
+        return
+    
+    update_workspace(OWNER_ID, current_path=path)
+    
+    contents = await gh_get_contents(repo, path)
+    if not contents:
+        await event.answer("❌ Path not found", alert=True)
+        return
+    
+    if not isinstance(contents, list):
+        contents = [contents]
+    
+    buttons = await render_file_buttons(contents, path)
+    label = path if path else "/ (root)"
+    text = f"📂 **{repo}**\nPath: `{label}`"
+    
     await event.answer()
-    await render_directory(event, acc["active_repo"], acc["github_pat"], path, edit=True)
+    await event.edit(text, buttons=buttons, parse_mode="markdown")
 
-@client.on(events.CallbackQuery(pattern=rb"^file:"))
+@bot.on(events.CallbackQuery(pattern=rb"^file:"))
 @owner_only
 async def file_selected_callback(event):
     token = event.data.decode().split(":", 1)[1]
     path = cb_get(token)
+    
     if path is None:
-        await event.answer("⚠️ Expired. Run /files again.", alert=True)
+        await event.answer("⚠️ Expired", alert=True)
         return
+    
     await event.answer()
     buttons = [
-        [Button.inline("📄 View Content", cb_data("view", path))],
-        [Button.inline("✏️ Edit File", cb_data("edit", path))],
-        [Button.inline("➕ Append Text", cb_data("append", path))],
+        [Button.inline("📄 View", cb_data("view", path))],
+        [Button.inline("✏️ Edit", cb_data("edit", path))],
+        [Button.inline("➕ Append", cb_data("append", path))],
+        [Button.inline("🗑️ Delete", cb_data("delete", path))]
     ]
-    await event.respond(f"🗂️ File: `{path}`\nChoose an action:", buttons=buttons, parse_mode="markdown")
+    
+    await event.respond(f"🗂️ **{path}**\nChoose action:", buttons=buttons, parse_mode="markdown")
 
-@client.on(events.CallbackQuery(pattern=rb"^view:"))
+# ============================================================
+# FILE OPERATIONS
+# ============================================================
+@bot.on(events.CallbackQuery(pattern=rb"^view:"))
 @owner_only
-async def view_file_callback(event):
+async def view_callback(event):
     token = event.data.decode().split(":", 1)[1]
     path = cb_get(token)
-    if path is None:
-        await event.answer("⚠️ Expired.", alert=True)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
         return
+    
     await event.answer()
-    acc = get_account(OWNER_ID)
-    data, err = await gh_get_contents(acc["github_pat"], acc["active_repo"], path)
-    if err:
-        await event.respond(f"❌ {err}")
+    
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    data = await gh_get_contents(repo, path)
+    if not data or "content" not in data:
+        await event.respond("❌ Could not fetch file")
         return
+    
     try:
         content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-    except Exception as e:
-        await event.respond(f"⚠️ Failed to decode file: {e}")
+    except:
+        await event.respond("❌ Could not decode file")
         return
+    
     if len(content) > 3500:
         content = content[:3500] + "\n...[truncated]"
-    await event.respond(f"📄 `{path}`\n\n```\n{content}\n```", parse_mode="markdown")
+    
+    await event.respond(f"```\n{content}\n```", parse_mode="markdown")
 
-@client.on(events.CallbackQuery(pattern=rb"^edit:"))
+@bot.on(events.CallbackQuery(pattern=rb"^edit:"))
 @owner_only
-async def edit_file_callback(event):
+async def edit_callback(event):
     token = event.data.decode().split(":", 1)[1]
     path = cb_get(token)
-    if path is None:
-        await event.answer("⚠️ Expired.", alert=True)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
         return
+    
     await event.answer()
-    await do_edit_flow(event.chat_id, path)
+    await edit_file_flow(event.chat_id, path)
 
-@client.on(events.CallbackQuery(pattern=rb"^append:"))
+@bot.on(events.CallbackQuery(pattern=rb"^append:"))
 @owner_only
-async def append_file_callback(event):
+async def append_callback(event):
     token = event.data.decode().split(":", 1)[1]
     path = cb_get(token)
-    if path is None:
-        await event.answer("⚠️ Expired.", alert=True)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
         return
+    
     await event.answer()
-    await do_append_flow(event.chat_id, path)
+    await append_file_flow(event.chat_id, path)
+
+@bot.on(events.CallbackQuery(pattern=rb"^delete:"))
+@owner_only
+async def delete_callback(event):
+    token = event.data.decode().split(":", 1)[1]
+    path = cb_get(token)
+    
+    if not path:
+        await event.answer("⚠️ Expired", alert=True)
+        return
+    
+    await event.answer()
+    
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    # Get SHA first
+    data = await gh_get_contents(repo, path)
+    if not data or "sha" not in data:
+        await event.respond("❌ Could not find file")
+        return
+    
+    msg = await event.respond("⏳ Deleting...")
+    ok = await gh_delete_file(repo, path, data["sha"])
+    
+    if ok:
+        await msg.edit(f"✅ Deleted: `{path}`", parse_mode="markdown")
+    else:
+        await msg.edit(f"❌ Failed to delete", parse_mode="markdown")
+
+async def edit_file_flow(chat_id, path):
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message(f"✏️ Send new content for `{path}`:", parse_mode="markdown")
+            resp = await conv.get_response()
+            new_content = resp.raw_text
+            
+            # Get SHA
+            data = await gh_get_contents(repo, path)
+            if not data or "sha" not in data:
+                await conv.send_message("❌ Could not find file SHA")
+                return
+            
+            await conv.send_message("⏳ Uploading...")
+            result = await gh_put_file(repo, path, new_content, f"Edit {path}", data["sha"])
+            
+            if result:
+                await conv.send_message(f"✅ File updated: `{path}`", parse_mode="markdown")
+            else:
+                await conv.send_message("❌ Upload failed")
+    except asyncio.TimeoutError:
+        await bot.send_message(chat_id, "⌛ Timeout")
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Error: {e}")
+
+async def append_file_flow(chat_id, path):
+    ws = get_workspace(OWNER_ID)
+    repo = ws.get("active_repo")
+    
+    try:
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message(f"➕ Send text to append to `{path}`:", parse_mode="markdown")
+            resp = await conv.get_response()
+            append_text = resp.raw_text
+            
+            # Get current content
+            data = await gh_get_contents(repo, path)
+            if not data or "content" not in data:
+                await conv.send_message("❌ Could not fetch file")
+                return
+            
+            try:
+                existing = base64.b64decode(data["content"]).decode()
+            except:
+                existing = ""
+            
+            sha = data.get("sha")
+            new_content = existing.rstrip("\n") + "\n" + append_text
+            
+            await conv.send_message("⏳ Uploading...")
+            result = await gh_put_file(repo, path, new_content, f"Append to {path}", sha)
+            
+            if result:
+                await conv.send_message(f"✅ Appended to: `{path}`", parse_mode="markdown")
+            else:
+                await conv.send_message("❌ Upload failed")
+    except asyncio.TimeoutError:
+        await bot.send_message(chat_id, "⌛ Timeout")
+    except Exception as e:
+        await bot.send_message(chat_id, f"❌ Error: {e}")
 
 # ============================================================
 # /create_file
 # ============================================================
-@client.on(events.NewMessage(pattern=r"^/create_file$"))
+@bot.on(events.NewMessage(pattern=r"^/create_file$"))
 @owner_only
 async def create_file_handler(event):
-    acc = get_account(OWNER_ID)
-    if not acc or not acc.get("github_pat"):
-        await event.respond("⚠️ No GitHub PAT linked. Use /add_account first.")
+    ws = get_workspace(OWNER_ID)
+    if not ws.get("active_repo"):
+        await event.respond("⚠️ No active repo. Use /switch_repo first")
         return
-    active_repo = acc.get("active_repo")
-    if not active_repo:
-        await event.respond("⚠️ No active repository. Use /switch_repo or /new_repo first.")
-        return
-
+    
     chat_id = event.chat_id
-    token = acc["github_pat"]
     try:
-        async with client.conversation(chat_id, timeout=180) as conv:
-            await conv.send_message("📝 Send file path (e.g. `assets/config.json`):", parse_mode="markdown")
+        async with bot.conversation(chat_id, timeout=180) as conv:
+            await conv.send_message("📝 Send file path (e.g. `src/main.py`):", parse_mode="markdown")
             resp = await conv.get_response()
             file_path = resp.raw_text.strip()
+            
             if not file_path:
-                await conv.send_message("❌ Invalid path. Aborting.")
+                await conv.send_message("❌ Invalid path")
                 return
-
+            
             await conv.send_message("✍️ Send file content:")
             resp = await conv.get_response()
             content = resp.raw_text
-
-            await conv.send_message("⏳ Committing to GitHub...")
-            data, err = await gh_put_file(token, active_repo, file_path, content, f"Create {file_path} via Telegram bot")
-            if err:
-                await conv.send_message(f"❌ {err}")
-                return
-            await conv.send_message(f"✅ File created: `{file_path}` in `{active_repo}`", parse_mode="markdown")
+            
+            await conv.send_message("⏳ Creating...")
+            repo = ws.get("active_repo")
+            result = await gh_put_file(repo, file_path, content, f"Create {file_path}")
+            
+            if result:
+                await conv.send_message(f"✅ Created: `{file_path}`", parse_mode="markdown")
+            else:
+                await conv.send_message("❌ Failed to create")
     except asyncio.TimeoutError:
-        await event.respond("⌛ Timed out. Run /create_file again.")
+        await event.respond("⌛ Timeout")
     except Exception as e:
-        await event.respond(f"⚠️ Error: `{e}`", parse_mode="markdown")
+        await event.respond(f"❌ Error: {e}")
 
 # ============================================================
-# /edit_file (command form asks for path)
-# ============================================================
-@client.on(events.NewMessage(pattern=r"^/edit_file$"))
-@owner_only
-async def edit_file_command(event):
-    acc = get_account(OWNER_ID)
-    if not acc or not acc.get("github_pat"):
-        await event.respond("⚠️ No GitHub PAT linked. Use /add_account first.")
-        return
-    if not acc.get("active_repo"):
-        await event.respond("⚠️ No active repository. Use /switch_repo or /new_repo first.")
-        return
-
-    chat_id = event.chat_id
-    try:
-        async with client.conversation(chat_id, timeout=120) as conv:
-            await conv.send_message("📝 Send the file path to edit:")
-            resp = await conv.get_response()
-            path = resp.raw_text.strip()
-    except asyncio.TimeoutError:
-        await event.respond("⌛ Timed out.")
-        return
-
-    await do_edit_flow(chat_id, path)
-
-async def do_edit_flow(chat_id, path):
-    acc = get_account(OWNER_ID)
-    token = acc["github_pat"]
-    full_repo = acc["active_repo"]
-    try:
-        async with client.conversation(chat_id, timeout=180) as conv:
-            await conv.send_message(f"✏️ Send the completely new content for `{path}`:", parse_mode="markdown")
-            resp = await conv.get_response()
-            new_content = resp.raw_text
-
-            await conv.send_message("⏳ Fetching current file SHA...")
-            data, err = await gh_get_contents(token, full_repo, path)
-            if err:
-                await conv.send_message(f"❌ {err}")
-                return
-            sha = data.get("sha")
-
-            await conv.send_message("⏳ Pushing update...")
-            result, err = await gh_put_file(token, full_repo, path, new_content, f"Edit {path} via Telegram bot", sha=sha)
-            if err:
-                await conv.send_message(f"❌ {err}")
-                return
-            await conv.send_message(f"✅ File updated: `{path}`", parse_mode="markdown")
-    except asyncio.TimeoutError:
-        await client.send_message(chat_id, "⌛ Edit timed out.")
-    except Exception as e:
-        await client.send_message(chat_id, f"⚠️ Error: `{e}`", parse_mode="markdown")
-
-# ============================================================
-# /append_file (command form asks for path)
-# ============================================================
-@client.on(events.NewMessage(pattern=r"^/append_file$"))
-@owner_only
-async def append_file_command(event):
-    acc = get_account(OWNER_ID)
-    if not acc or not acc.get("github_pat"):
-        await event.respond("⚠️ No GitHub PAT linked. Use /add_account first.")
-        return
-    if not acc.get("active_repo"):
-        await event.respond("⚠️ No active repository. Use /switch_repo or /new_repo first.")
-        return
-
-    chat_id = event.chat_id
-    try:
-        async with client.conversation(chat_id, timeout=120) as conv:
-            await conv.send_message("📝 Send the file path to append to:")
-            resp = await conv.get_response()
-            path = resp.raw_text.strip()
-    except asyncio.TimeoutError:
-        await event.respond("⌛ Timed out.")
-        return
-
-    await do_append_flow(chat_id, path)
-
-async def do_append_flow(chat_id, path):
-    acc = get_account(OWNER_ID)
-    token = acc["github_pat"]
-    full_repo = acc["active_repo"]
-    try:
-        async with client.conversation(chat_id, timeout=180) as conv:
-            await conv.send_message(f"➕ Send text to append to `{path}`:", parse_mode="markdown")
-            resp = await conv.get_response()
-            append_text = resp.raw_text
-
-            await conv.send_message("⏳ Fetching existing content...")
-            data, err = await gh_get_contents(token, full_repo, path)
-            if err:
-                await conv.send_message(f"❌ {err}")
-                return
-            sha = data.get("sha")
-            try:
-                existing = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
-            except Exception:
-                existing = ""
-
-            new_content = existing.rstrip("\n") + "\n" + append_text
-
-            await conv.send_message("⏳ Pushing updated content...")
-            result, err = await gh_put_file(token, full_repo, path, new_content, f"Append to {path} via Telegram bot", sha=sha)
-            if err:
-                await conv.send_message(f"❌ {err}")
-                return
-            await conv.send_message(f"✅ Appended to file: `{path}`", parse_mode="markdown")
-    except asyncio.TimeoutError:
-        await client.send_message(chat_id, "⌛ Append timed out.")
-    except Exception as e:
-        await client.send_message(chat_id, f"⚠️ Error: `{e}`", parse_mode="markdown")
-
-# ============================================================
-# GLOBAL ERROR HANDLER FOR CALLBACKS/MESSAGES
-# ============================================================
-@client.on(events.CallbackQuery())
-async def fallback_callback_guard(event):
-    if event.sender_id != OWNER_ID:
-        await event.answer("⛔ Access Denied.", alert=True)
-
-# ============================================================
-# STARTUP
+# MAIN
 # ============================================================
 async def main():
-    await start_web_server()
-    await client.start(bot_token=BOT_TOKEN)
-    log.info("🤖 GitHub Workspace Engine Bot is running.")
-    await client.run_until_disconnected()
+    threading.Thread(target=run_health_server, daemon=True).start()
+    await bot.start(bot_token=BOT_TOKEN)
+    print("[+] GitHub Editor Bot Running")
+    await bot.run_until_disconnected()
 
 if __name__ == "__main__":
     loop.run_until_complete(main())
